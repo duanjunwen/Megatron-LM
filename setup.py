@@ -105,24 +105,24 @@ setuptools.setup(
         'Operating System :: OS Independent',
     ],
     packages=setuptools.find_namespace_packages(include=["megatron.core", "megatron.core.*"]),
-    # ext_modules=[
-    #     Extension(
-    #         "megatron.core.datasets.helpers_cpp",
-    #         sources=["megatron/core/datasets/helpers.cpp"],
-    #         language="c++",
-    #         extra_compile_args=(
-    #             subprocess.check_output(["python3", "-m", "pybind11", "--includes"])
-    #             .decode("utf-8")
-    #             .strip()
-    #             .split()
-    #         )
-    #         + ['-O3', '-Wall', '-std=c++17'],
-    #         optional=True,
-    #     )
-    # ],
+    ext_modules=[
+        Extension(
+            "megatron.core.datasets.helpers_cpp",
+            sources=["megatron/core/datasets/helpers.cpp"],
+            language="c++",
+            extra_compile_args=(
+                subprocess.check_output(["python3", "-m", "pybind11", "--includes"])
+                .decode("utf-8")
+                .strip()
+                .split()
+            )
+            + ['-O3', '-Wall', '-std=c++17'],
+            optional=True,
+        )
+    ],
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
     keywords=__keywords__,
-    # install_requires=install_requires,
+    install_requires=install_requires,
 )
