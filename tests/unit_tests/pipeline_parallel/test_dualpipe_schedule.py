@@ -86,6 +86,7 @@ def test_dualpipeV_schedule(test_config):
     print_pipeline_details(
         zbv_schedule,
         mbs_mode=True,
+        empty_bubble_str_mode=True
     )
 
     # dual V
@@ -106,9 +107,10 @@ def test_dualpipeV_schedule(test_config):
     print_pipeline_details(
         dualV_schedule,
         mbs_mode=True,
+        empty_bubble_str_mode=True
     )
 
 
 if __name__ == "__main__":
-    test_dualpipe_schedule()
-    # test_dualpipeV_schedule()
+    # test_dualpipe_schedule()
+    test_dualpipeV_schedule()
