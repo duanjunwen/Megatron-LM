@@ -1,7 +1,7 @@
 from math import ceil, floor
 from typing import List
 
-from megatron.core.pipeline_parallel.scheduler.v_schedule import ScheduledNode
+from megatron.core.pipeline_parallel.scheduler.graph import ScheduledNode
 
 DUALPIPE_NODETYPE = {"F", "B", "W", "Full_B", "EMPTY_BUBBLE"}
 
