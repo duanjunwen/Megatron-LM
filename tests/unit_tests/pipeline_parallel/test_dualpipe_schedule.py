@@ -123,6 +123,6 @@ def test_dualpipeV_schedule(test_config):
     
 
 if __name__ == "__main__":
-    # test_dualpipe_schedule()
+    test_dualpipe_schedule()
     # test_zerobubbleV_schedule()
     test_dualpipeV_schedule()
