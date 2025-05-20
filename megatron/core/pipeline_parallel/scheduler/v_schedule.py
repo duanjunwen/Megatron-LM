@@ -685,40 +685,45 @@ class DualVPipelineGraph(object):
         self.current_recv_f_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
         self.current_recv_b_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
         
-    def forward_compute_schedule(self, phase: int, stage:int, microbatch_id: int) -> None:
+    def forward_compute_schedule(self, phase: int, stage:int, microbatch_id: int = None) -> None:
+        chunk_id = self.current_f_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.F,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
         
-        # self.current_f_chunk_id[phase] += 1
+        self.current_f_chunk_id[stage][phase] += 1
 
-    def backward_compute_schedule(self, phase: int, stage:int, microbatch_id: int, enable_zb: bool = False) -> None:
-        # chunk_id = self.current_b_chunk_id[phase]
+    def backward_compute_schedule(self, phase: int, stage:int, microbatch_id: int = None, enable_zb: bool = False) -> None:
+        chunk_id = self.current_b_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.B if enable_zb else FuncType.BW,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
-        # self.current_b_chunk_id[phase] += 1
+        self.current_b_chunk_id[stage][phase] += 1
+        if enable_zb:
+            pass # enable zb, w will do at weight chunk
+        else:
+            self.current_w_chunk_id[stage][phase] += 1
 
     def forward_backward_compute_schedule(self, phase0: int, phase1: int, stage:int, fwd_microbatch_id: int, bwd_microbatch_id: int, ) -> None:
         self.forward_compute_schedule(phase0, stage, fwd_microbatch_id)
         self.backward_compute_schedule(phase1, stage, bwd_microbatch_id)
         return
 
-    def forward_schedule(self, phase: int, stage: int, microbatch_id: int, recv: bool = True, send: bool = True) -> None:
+    def forward_schedule(self, phase: int, stage: int, microbatch_id: int = None, recv: bool = True, send: bool = True) -> None:
         # phase: model chunk id , 0 is left chunk, 1 is right chunk
         if recv:
             self.recv_forward_schedule(phase, stage, microbatch_id)
@@ -728,7 +733,7 @@ class DualVPipelineGraph(object):
         if send:
             self.send_forward_schedule(phase, stage, microbatch_id)
 
-    def backward_schedule(self, phase: int, stage:int, microbatch_id: int, enable_zb: bool = False, recv: bool = True, send: bool = True) -> None:
+    def backward_schedule(self, phase: int, stage:int, microbatch_id: int = None, enable_zb: bool = False, recv: bool = True, send: bool = True) -> None:
         if recv:
             self.recv_backward_schedule(phase, stage, microbatch_id)
 
@@ -737,7 +742,7 @@ class DualVPipelineGraph(object):
         if send:
             self.send_backward_schedule(phase, stage, microbatch_id)
 
-    def forward_backward_schedule(self, phase0: int, phase1: int, stage:int, fwd_microbatch_id: int, bwd_microbatch_id: int, recv0: bool = True) -> None:
+    def forward_backward_schedule(self, phase0: int, phase1: int, stage:int, fwd_microbatch_id: int = None, bwd_microbatch_id: int = None, recv0: bool = True) -> None:
         if recv0:
             self.recv_forward_schedule(phase0, stage, fwd_microbatch_id,)
         self.recv_backward_schedule(phase1, stage, bwd_microbatch_id,)
@@ -747,83 +752,91 @@ class DualVPipelineGraph(object):
         self.send_forward_schedule(phase0, stage, fwd_microbatch_id,)
         self.send_backward_schedule(phase1, stage, bwd_microbatch_id,)
 
-    def weight_compute_schedule(self, phase: int, stage:int, microbatch_id: int, ) -> None:
+    def weight_compute_schedule(self, phase: int, stage:int, microbatch_id: int = None, ) -> None:
+        chunk_id = self.current_w_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.W,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
+        self.current_w_chunk_id[stage][phase] += 1
 
-    def recv_forward_schedule(self, phase: int, stage:int, microbatch_id: int) -> None:
+    def recv_forward_schedule(self, phase: int, stage:int, microbatch_id: int = None) -> None:
         # Append recv forward schedule Node to schedule[rank]
         
         # first stage and phase 0 no recv
         # last stage and phase 1 no recv
         if (stage == 0 and phase == 0) or (stage == (self.pp_size - 1) and phase == 1):
             return
+        chunk_id = self.current_recv_f_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.RECV_FORWARD,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
-        # self.current_recv_f_chunk_id[phase] += 1
+        self.current_recv_f_chunk_id[stage][phase] += 1
         return 
 
-    def send_forward_schedule(self, phase: int, stage:int, microbatch_id: int) -> None:
+    def send_forward_schedule(self, phase: int, stage:int, microbatch_id: int = None) -> None:
         if (stage == 0 and phase == 1) or (stage == (self.pp_size - 1) and phase == 0):
             return
+        
+        chunk_id = self.current_send_f_chunk_id[stage][phase]
+        
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.SEND_FORWARD,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
-        # self.current_send_f_chunk_id[phase] += 1
+        self.current_send_f_chunk_id[stage][phase] += 1
 
-    def recv_backward_schedule(self, phase: int, stage:int, microbatch_id: int) -> None:
+    def recv_backward_schedule(self, phase: int, stage:int, microbatch_id: int = None) -> None:
         if (stage == 0 and phase == 1) or (stage == (self.pp_size - 1) and phase == 0):
             return
+        chunk_id = self.current_recv_b_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.RECV_BACKWARD,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
-        # self.current_recv_b_chunk_id[phase] += 1
+        self.current_recv_b_chunk_id[stage][phase] += 1
         return
 
-    def send_backward_schedule(self, phase: int, stage:int, microbatch_id: int) -> None:
+    def send_backward_schedule(self, phase: int, stage:int, microbatch_id: int = None) -> None:
         if (stage == 0 and phase == 0) or (stage == (self.pp_size - 1) and phase == 1):
             return
+        chunk_id = self.current_send_b_chunk_id[stage][phase]
         self.dualV_schedules[stage].append(
             VScheduledNode(
                 type=FuncType.SEND_BACKWARD,
                 chunk=phase,
                 stage=stage,
-                minibatch=microbatch_id,
+                minibatch=chunk_id,
                 start_time=0,
                 completion_time=0, 
             )
         )
-        # self.current_send_b_chunk_id[phase] += 1
+        self.current_send_b_chunk_id[stage][phase] += 1
 
     def get_dual_v_schedule(
         self, 
@@ -836,62 +849,77 @@ class DualVPipelineGraph(object):
             # Step 1: nF0
             step_1 = (self.pp_size - rank - 1) * 2
             for i in range(step_1):
-                self.forward_schedule(phase=0,stage=rank, microbatch_id=i)
+                self.forward_schedule(phase=0,stage=rank)
 
             # Step 2: nF0F1
             step_2 = rank + 1 + additional_warmup
-            self.recv_forward_schedule(phase=0, stage=rank, microbatch_id=step_1 + 1)
+            ############## we add one more warmup step for both phase 0 and phase 1 ##############
+            self.recv_forward_schedule(phase=0, stage=rank)
             for i in range(step_2):
-                self.forward_schedule(phase=0, stage=rank, microbatch_id=step_1 + i, recv=False, send=False)
-                self.recv_forward_schedule(phase=0, stage=rank, microbatch_id=step_1 + 1)
-                self.forward_schedule(phase=1, stage=rank, microbatch_id=i, send=(not rank==(self.pp_size-1)) or (i < step_2 - 1))
-                self.send_forward_schedule(phase=0, stage=rank, microbatch_id=step_1 + 1)
+                self.forward_schedule(phase=0, stage=rank, recv=False, send=False)
+                self.recv_forward_schedule(phase=0, stage=rank)
+                self.forward_schedule(phase=1, stage=rank, send=(not rank==(self.pp_size-1)) or (i < step_2 - 1))
+                self.send_forward_schedule(phase=0, stage=rank)
 
             # Step 3: nB1W1F1 (Use zero bubble)
-            step_3 = self.pp_size - rank - 1 + additional_warmup
+            step_3 = self.pp_size - rank - 1
             for i in range(step_3):
-                self.backward_schedule(phase=1, stage=rank, microbatch_id=i, enable_zb=True)
-                self.recv_forward_schedule(phase=1, stage=rank, microbatch_id=i + rank + 1,)
-                self.weight_compute_schedule(phase=1, stage=rank, microbatch_id=i,)
-                self.forward_schedule(phase=1,stage=rank, microbatch_id=i + rank + 1, recv=False)
+                self.backward_schedule(phase=1, stage=rank, enable_zb=True)
+                self.recv_forward_schedule(phase=1, stage=rank,)
+                self.weight_compute_schedule(phase=1, stage=rank, )
+                self.forward_schedule(phase=1,stage=rank, recv=False)
 
             # Step 4 (Main step): nF0B1F1B0
-            step_4 = self.num_microbatch - self.pp_size * 2 + rank + 1 + additional_warmup
+            ############## we reduce one warmup step for F0 and F1 ##############
+            step_4 = self.num_microbatch - self.pp_size * 2 + rank + 1
             for i in range(step_4):
                 if i == 0:
                     if rank == (self.pp_size - 1):
                         # NOTE: We don't overlap these two chunks to further reduce bubble size.
-                        self.forward_schedule(phase=0, stage=rank, microbatch_id=step_1+step_2,recv=False, send=False)
-                        self.send_forward_schedule(phase=1, stage=rank, microbatch_id=step_1+step_2,)
-                        self.backward_schedule(phase=1, stage=rank, microbatch_id=step_3, send=False)
-                        self.send_forward_schedule(phase=0, stage=rank, microbatch_id=step_1+step_2,)
-                        self.send_backward_schedule(phase=1, stage=rank, microbatch_id=step_3,)
+                        self.forward_schedule(phase=0, stage=rank,recv=False, send=False)
+                        self.send_forward_schedule(phase=1, stage=rank,)
+                        self.backward_schedule(phase=1, stage=rank, send=False)
+                        self.send_forward_schedule(phase=0, stage=rank, )
+                        self.send_backward_schedule(phase=1, stage=rank,)
                     else:
-                        self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, fwd_microbatch_id=step_1+step_2,bwd_microbatch_id=step_3, recv0=False)
+                        self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, recv0=False)
                 else:
-                    self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, fwd_microbatch_id=step_1+step_2+i,bwd_microbatch_id=self.pp_size - rank + i - 1)
-                self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, fwd_microbatch_id= step_4 - rank + i + 1,bwd_microbatch_id=i)
+                    if i < step_4 - additional_warmup:
+                        # Do F0B1
+                        self.forward_backward_schedule(phase0=0, phase1=1, stage=rank,)
+                    else:
+                        # Do B1 only
+                        self.backward_schedule(phase=1, stage=rank)
+                    # self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, fwd_microbatch_id=step_1+step_2+i,bwd_microbatch_id=self.pp_size - rank + i - 1)
+                if i < step_4 - additional_warmup:
+                    # Do F1B0
+                    self.forward_backward_schedule(phase0=1, phase1=0, stage=rank,)
+                else:
+                    # Do B0 only
+                    self.backward_schedule(phase=0, stage=rank,)
+                
+                # self.forward_backward_schedule(phase0=0, phase1=1, stage=rank, fwd_microbatch_id= step_4 - rank + i + 1,bwd_microbatch_id=i)
 
             # Step 5: nB1F1B0
-            step_5 = self.pp_size - rank - 1 + additional_warmup
+            step_5 = self.pp_size - rank - 1
             for i in range(step_5):
-                self.backward_schedule(phase=1, stage=rank, microbatch_id=step_4 + step_5 + i)
-                self.forward_backward_schedule(phase0=1, phase1=0, stage=rank, fwd_microbatch_id=step_2 + step_4 + step_5 + i ,bwd_microbatch_id=step_4 + i)
+                self.backward_schedule(phase=1, stage=rank,)
+                self.forward_backward_schedule(phase0=1, phase1=0, stage=rank,)
             
         
             # Step 6: nB1B0 (The second half of the chunks use zero bubble)
-            step_6 = rank + 1 + additional_warmup
+            step_6 = rank + 1
             enable_zb = False
             for i in range(step_6):
                 if i == step_6 // 2 and rank % 2 == 1:
                     enable_zb = True
-                self.backward_schedule(phase=1, stage=rank, microbatch_id=step_3 + step_4 + step_5 + i, enable_zb=enable_zb)
+                self.backward_schedule(phase=1, stage=rank, enable_zb=enable_zb)
                 if i == step_6 // 2 and rank % 2 == 0:
                     enable_zb = True
-                self.backward_schedule(phase=0, stage=rank, microbatch_id=step_3 + step_4 + i, enable_zb=enable_zb)
+                self.backward_schedule(phase=0, stage=rank, enable_zb=enable_zb)
 
             # Step 7: nWB0 (Use zero bubble)
-            step_7 = self.pp_size - rank - 1 + additional_warmup
+            step_7 = self.pp_size - rank - 1
             # find last Full_Backward(BW) micobatch id phase 0 / 1
             
             phase0_last_BW_microbatch_id = 0
@@ -902,8 +930,8 @@ class DualVPipelineGraph(object):
                         phase0_last_BW_microbatch_id = node.minibatch
                     elif node.chunk == 1:
                         phase1_last_BW_microbatch_id = node.minibatch
-            phase0_rest_W = [i for i in range(phase0_last_BW_microbatch_id + 1, self.num_microbatch + additional_warmup)]
-            phase1_rest_W = [i for i in range(phase1_last_BW_microbatch_id + 1, self.num_microbatch + additional_warmup)]
+            phase0_rest_W = [i for i in range(phase0_last_BW_microbatch_id + 1, self.num_microbatch)]
+            phase1_rest_W = [i for i in range(phase1_last_BW_microbatch_id + 1, self.num_microbatch)]
             for i in range(step_7):
                 microbatch_id = self.num_microbatch - 1
                 phase = 0
@@ -915,11 +943,11 @@ class DualVPipelineGraph(object):
                         phase = 0
                         microbatch_id = phase0_rest_W.pop(0)
                 
-                self.weight_compute_schedule(phase=phase, stage=rank, microbatch_id=microbatch_id)
-                self.backward_schedule(phase=0, stage=rank, microbatch_id=step_4 + step_5 + step_6 + i, enable_zb=True)
+                self.weight_compute_schedule(phase=phase, stage=rank,)
+                self.backward_schedule(phase=0, stage=rank, enable_zb=True)
 
             # Step 8: nW
-            step_8 = rank + 1 + additional_warmup
+            step_8 = rank + 1
             for i in range(step_8):
                 microbatch_id = self.num_microbatch - 1
                 phase = 0
@@ -930,7 +958,7 @@ class DualVPipelineGraph(object):
                     if phase0_rest_W:
                         phase = 0
                         microbatch_id = phase0_rest_W.pop(0)
-                self.weight_compute_schedule(phase=0, stage=rank, microbatch_id=microbatch_id)
+                self.weight_compute_schedule(phase=phase, stage=rank,)
 
     def print_pipeline_details(
         self,

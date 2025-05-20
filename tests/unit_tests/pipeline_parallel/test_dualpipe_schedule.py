@@ -52,7 +52,7 @@ def test_dualpipe_schedule(test_config):
         num_microbatch=20,
     )
     dualpipe.get_dualpipe_schedule(
-        additional_warmup=additional_warmup
+        additional_warmup=test_config['additional_warmup']
     )
     print(f"\nDualPipe V schedule\n")
     dualpipe.print_pipeline_details(
@@ -99,6 +99,7 @@ def test_zerobubbleV_schedule(test_config):
     [
         {
             "n_stage": 4,
+            "additional_warmup":1,
         },
     ],
 )
@@ -108,7 +109,9 @@ def test_dualpipeV_schedule(test_config):
         pp_size=test_config["n_stage"], 
         num_microbatch=10, 
     )
-    dualV_graph.get_dual_v_schedule()
+    dualV_graph.get_dual_v_schedule(
+        additional_warmup=test_config['additional_warmup']
+    )
     
     print(f"\nDualPipe V schedule\n")
     dualV_graph.print_pipeline_details(
@@ -120,6 +123,6 @@ def test_dualpipeV_schedule(test_config):
     
 
 if __name__ == "__main__":
-    test_dualpipe_schedule()
+    # test_dualpipe_schedule()
     # test_zerobubbleV_schedule()
-    # test_dualpipeV_schedule()
+    test_dualpipeV_schedule()
