@@ -1,4 +1,5 @@
 from typing import List
+# from megatron.core.pipeline_parallel.scheduler.dualpipe_schedule import DUALPIPE_NODETYPE, DualPipeGraph
 from megatron.core.pipeline_parallel.scheduler.dualpipe_schedule import DUALPIPE_NODETYPE, DualPipeGraph
 from megatron.core.pipeline_parallel.scheduler.v_schedule import DualVPipelineGraph, PipelineGraph, ScheduledNode
 from utils import parameterize
@@ -40,25 +41,27 @@ def print_pipeline_details(
     "test_config",
     [
         {
-            "n_stage": 4,
+            "n_stage": 8,
+            "additional_warmup":1,
         },
     ],
 )
 def test_dualpipe_schedule(test_config):
     dualpipe = DualPipeGraph(
-        n_stage=test_config["n_stage"],
-        n_micro=(test_config["n_stage"] + 2) * 2,
+        pp_size=test_config["n_stage"], 
+        num_microbatch=20,
     )
-    dualpipe_schedule = dualpipe.get_dualpipe_schedule()
-    # print(dualpipe_schedule)
-    dualpipe.print_details(
-        dualpipe_schedule,
-        # chunk_mode=True,
+    dualpipe.get_dualpipe_schedule(
+        additional_warmup=additional_warmup
+    )
+    print(f"\nDualPipe V schedule\n")
+    dualpipe.print_pipeline_details(
+        pipeline_schedule=dualpipe.dualpipe_schedules,
+        show_comm=False,
         mbs_mode=True,
-        empty_bubble_str_mode=True,
+        # chunk_mode=True,
     )
-
-
+    
 @parameterize(
     "test_config",
     [
@@ -67,7 +70,7 @@ def test_dualpipe_schedule(test_config):
         },
     ],
 )
-def test_dualpipeV_schedule(test_config):
+def test_zerobubbleV_schedule(test_config):
     mem_f = 34 * 4096 + 5 * 24 * 4096
     mem_w = - 32 * 4096
     mem_b = - mem_w - mem_f
@@ -90,39 +93,26 @@ def test_dualpipeV_schedule(test_config):
         empty_bubble_str_mode=True
     )
 
-    # # dual V
-    # dualV_graph = DualVPipelineGraph(
-    #     n_stage=test_config["n_stage"],
-    #     n_micro=8,
-    #     f_cost=1,
-    #     b_cost=1,
-    #     w_cost=1,
-    #     c_cost=1,
-    #     f_mem=mem_f * 1.5,
-    #     b_mem=mem_b * 1.5,
-    #     w_mem=mem_w * 1.5,
-    # )
-    # dualV_schedule = dualV_graph.get_v_schedule()
-    # dualV_schedule = dualV_graph.convert_to_dualV(dualV_schedule)
-    # print(f"\nDualPipe V schedule\n")
-    # print_pipeline_details(
-    #     dualV_schedule,
-    #     mbs_mode=True,
-    #     empty_bubble_str_mode=True
-    # )
 
-    
+@parameterize(
+    "test_config",
+    [
+        {
+            "n_stage": 4,
+        },
+    ],
+)
+def test_dualpipeV_schedule(test_config):
     # dual V
-    dualV_refer_graph = DualVPipelineGraph(
+    dualV_graph = DualVPipelineGraph(
         pp_size=test_config["n_stage"], 
         num_microbatch=10, 
     )
-    dualV_refer_graph.get_dual_v_schedule()
+    dualV_graph.get_dual_v_schedule()
     
-
     print(f"\nDualPipe V schedule\n")
-    dualV_refer_graph.print_pipeline_details(
-        pipeline_schedule=dualV_refer_graph.dualV_schedules,
+    dualV_graph.print_pipeline_details(
+        pipeline_schedule=dualV_graph.dualV_schedules,
         show_comm=False,
         mbs_mode=True,
         # chunk_mode=True,
@@ -130,5 +120,6 @@ def test_dualpipeV_schedule(test_config):
     
 
 if __name__ == "__main__":
-    # test_dualpipe_schedule()
-    test_dualpipeV_schedule()
+    test_dualpipe_schedule()
+    # test_zerobubbleV_schedule()
+    # test_dualpipeV_schedule()

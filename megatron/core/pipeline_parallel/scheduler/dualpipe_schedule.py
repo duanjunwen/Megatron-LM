@@ -1,12 +1,16 @@
 from math import ceil, floor
-from typing import List
+from typing import Tuple, List, Union, Callable, Optional
 
-from megatron.core.pipeline_parallel.scheduler.graph import ScheduledNode
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from megatron.core.pipeline_parallel.scheduler.graph import ScheduledNode, VScheduledNode, FuncType
+
 
 DUALPIPE_NODETYPE = {"F", "B", "W", "Full_B", "EMPTY_BUBBLE"}
 
 
-class DualPipeGraph(object):
+class DualPipeGraph_(object):
     """DualPipeGraph
     We brokendown DualPipe to three Pipe_Stage: Warmup, Middle, End
     Warmup contains:
@@ -1488,3 +1492,388 @@ class DualPipeGraph(object):
         self.get_middle_schedule(pipeline_schedule)
         self.get_end_schedule(pipeline_schedule)
         return pipeline_schedule
+    
+
+# Reference from https://github.com/deepseek-ai/DualPipe/blob/main/dualpipe/dualpipe.py
+class DualPipeGraph(object):
+    def __init__(
+        self,
+        pp_size: int = 1, 
+        num_microbatch: int = 1, 
+    ) -> None:
+        self.pp_size = pp_size
+        self.num_microbatch = num_microbatch
+        self.dualpipe_schedules: List[List[VScheduledNode]] = [[] for _ in range(pp_size)]
+        
+        # rank_mapping: Map rank in process_group to actual pp rank.
+        # rank_inverse_mapping: Map actual pp rank to rank in process_group.
+        # if rank_mapping is None:
+        self.rank_mapping = list(range(self.pp_size))
+        self.rank_inverse_mapping = [None] * (self.pp_size + 1)
+        for i in range(self.pp_size):
+            self.rank_inverse_mapping[self.rank_mapping[i]] = i
+        
+        self.current_f_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_b_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_w_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_send_f_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_send_b_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_recv_f_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+        self.current_recv_b_chunk_id: List[List[int]] = [[0, 0] for _ in range(self.pp_size)]
+    
+    def get_first_rank(self,):
+        return self.rank_inverse_mapping[0]
+    
+    def get_last_rank(self,):
+        return self.rank_inverse_mapping[self.pp_size - 1]
+    
+    def get_prev_rank(self, curr_rank):
+        return self.rank_inverse_mapping[curr_rank - 1]
+    
+    def get_next_rank(self, curr_rank):
+        return self.rank_inverse_mapping[curr_rank + 1]
+    
+    def is_first_rank(self, curr_rank):
+        return curr_rank == 0
+    
+    def is_last_rank(self, curr_rank):
+        return curr_rank == self.pp_size - 1
+    
+    def is_in_second_half(self, curr_rank):
+        return curr_rank >= self.pp_size // 2
+    
+    def is_middle_rank(self, curr_rank):
+        return (curr_rank == self.pp_size // 2 - 1) or (curr_rank == self.pp_size // 2)
+
+    
+    def forward_compute_schedule(self, phase: int, rank:int, microbatch_id: int = None) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        chunk_id = self.current_f_chunk_id[rank][phase]
+
+        is_last_stage = (self.is_first_rank(curr_rank=rank) and phase == 1) or (self.is_last_rank(curr_rank=rank) and phase == 0)
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.F,
+                chunk=phase,
+                stage=rank,
+                minibatch=chunk_id,
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+        self.current_f_chunk_id[rank][phase] += 1
+
+    def backward_compute_schedule(self, phase: int, rank:int, microbatch_id: int = None, enable_zb: bool = False) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        chunk_id = self.current_b_chunk_id[rank][phase]
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.B if enable_zb else FuncType.BW,
+                chunk=phase,
+                stage=rank,
+                minibatch=chunk_id,
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+        self.current_w_chunk_id[rank][phase] += 1
+        
+        self.current_b_chunk_id[rank][phase] += 1
+
+        is_last_stage = (self.is_first_rank(curr_rank=rank) and phase == 1) or (self.is_last_rank(curr_rank=rank) and phase == 0)
+
+
+    def forward_backward_compute_schedule(self, phase0: int, phase1: int, rank:int, fwd_microbatch_id: int, bwd_microbatch_id: int,) -> None:
+        self.forward_compute_schedule(phase=phase0, rank=rank, microbatch_id=self.current_f_chunk_id[rank][phase0])
+        self.backward_compute_schedule(phase=phase1, rank=rank, microbatch_id=self.current_b_chunk_id[rank][phase1])
+
+    def forward_schedule(self, phase: int, rank: int, microbatch_id: int = None, recv: bool = True, send: bool = True) -> None:
+        if recv:
+            self.recv_forward_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+        # self._commit_and_wait_comm()
+
+        self.forward_compute_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+
+        if send:
+            self.send_forward_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+
+    def backward_schedule(self, phase: int, rank:int, microbatch_id: int = None, enable_zb: bool = False, recv: bool = True, send: bool = True) -> None:
+        if recv:
+            self.recv_backward_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+
+        self.backward_compute_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id, enable_zb=enable_zb)
+
+        if send:
+            self.send_backward_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+
+    def forward_backward_schedule(self, phase0: int, phase1: int, rank:int, fwd_microbatch_id: int = None, bwd_microbatch_id: int = None, recv0: bool = True) -> None:
+        if recv0:
+            self.recv_forward_schedule(phase0, rank, fwd_microbatch_id,)
+        self.recv_backward_schedule(phase1, rank, bwd_microbatch_id,)
+
+        self.forward_backward_compute_schedule(phase0, phase1, rank, fwd_microbatch_id, bwd_microbatch_id)
+
+        self.send_forward_schedule(phase0, rank, fwd_microbatch_id,)
+        self.send_backward_schedule(phase1, rank, bwd_microbatch_id,)
+
+    def weight_compute_schedule(self, phase: int, rank:int, microbatch_id: int=None,) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        chunk_id = microbatch_id if microbatch_id else self.current_w_chunk_id[rank][phase]
+        
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.W,
+                chunk=phase,
+                stage=rank,
+                minibatch=chunk_id,
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+        self.current_w_chunk_id[rank][phase] += 1
+
+    def recv_forward_schedule(self, phase: int, rank: int, microbatch_id: int) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        is_first_stage = (self.is_first_rank(curr_rank=rank) and phase == 0) or (self.is_last_rank(curr_rank=rank) and phase == 1)
+        if is_first_stage:
+            return
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.RECV_FORWARD,
+                chunk=phase,
+                stage=rank,
+                minibatch=self.current_recv_f_chunk_id[rank][phase],
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+
+        self.current_recv_f_chunk_id[rank][phase] += 1
+
+
+    def send_forward_schedule(self, phase: int, rank:int, microbatch_id: int) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        is_last_stage = (self.is_first_rank(curr_rank=rank) and phase == 1) or (self.is_last_rank(curr_rank=rank) and phase == 0)
+        if is_last_stage:
+            return
+        chunk_id = self.current_send_f_chunk_id[rank][phase]
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.SEND_FORWARD,
+                chunk=phase,
+                stage=rank,
+                minibatch=chunk_id,
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+
+        self.current_send_f_chunk_id[rank][phase] += 1
+
+    def recv_backward_schedule(self, phase: int, rank:int, microbatch_id: int) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        is_last_stage = (self.is_first_rank(curr_rank=rank) and phase == 1) or (self.is_last_rank(curr_rank=rank) and phase == 0)
+        if is_last_stage:
+            return
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.RECV_BACKWARD,
+                chunk=phase,
+                stage=rank,
+                minibatch=self.current_recv_b_chunk_id[rank][phase],
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+        self.current_recv_b_chunk_id[rank][phase] += 1
+
+
+    def send_backward_schedule(self, phase: int, rank:int, microbatch_id: int) -> None:
+        phase ^= self.is_in_second_half(curr_rank=rank)
+        is_first_stage = (self.is_first_rank(curr_rank=rank) and phase == 0) or (self.is_last_rank(curr_rank=rank) and phase == 1)
+        if is_first_stage:
+            return
+
+        chunk_id = self.current_send_b_chunk_id[rank][phase]
+        
+        self.dualpipe_schedules[rank].append(
+            VScheduledNode(
+                type=FuncType.SEND_BACKWARD,
+                chunk=phase,
+                stage=rank,
+                minibatch=chunk_id,
+                start_time=0,
+                completion_time=0, 
+            )
+        )
+        self.current_send_b_chunk_id[rank][phase] += 1
+
+
+    def get_dualpipe_schedule(
+        self, 
+        additional_warmup: int = 0,
+    ) -> List[List[ScheduledNode]]:
+        """
+        """
+        additional_warmup = additional_warmup
+        for rank in range(self.pp_size):
+            num_ranks = self.pp_size
+            num_chunks = self.num_microbatch
+            assert num_ranks % 2 == 0
+            assert num_chunks > 0 and num_chunks % 2 == 0 and num_chunks >= num_ranks * 2, f"{num_chunks=}, {num_ranks=}"
+            num_half_ranks = num_ranks // 2
+            half_rank = min(rank, num_ranks - 1 - rank)
+            half_num_chunks = num_chunks // 2
+
+            # For the first half of the ranks: phase 0 means forward direction, phase 1 means reverse direction.
+            # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
+
+            # Step 1: nF0
+            # no addition warmup: step_1 = (num_half_ranks - half_rank - 1) * 
+            step_1 = (num_half_ranks - half_rank - 1) * 2
+            for i in range(step_1):
+                self.forward_schedule(phase=0,rank=rank, microbatch_id=None)
+
+            # Step 2: nF0F1
+            ############## we add one more warmup step for both phase 0 and phase 1 ##############
+            step_2 = half_rank + 1 + additional_warmup 
+            self.recv_forward_schedule(phase=0, rank=rank, microbatch_id=None)
+            for i in range(step_2):
+                self.forward_schedule(phase=0, rank=rank, microbatch_id=None, recv=False, send=self.is_middle_rank(curr_rank=rank))
+                self.recv_forward_schedule(phase=0, rank=rank, microbatch_id=None,)
+                self.forward_schedule(phase=1, rank=rank, microbatch_id=None, send=(not self.is_middle_rank(curr_rank=rank)) or (i < step_2 - 1))
+                if not self.is_middle_rank(curr_rank=rank):
+                    self.send_forward_schedule(phase=0, rank=rank, microbatch_id=None)
+
+            # Step 3: nB1W1F1 (Use zero bubble)
+            step_3 = num_half_ranks - half_rank - 1
+            for i in range(step_3):
+                self.backward_schedule(phase=1, rank=rank, microbatch_id=None, enable_zb=True)
+                self.recv_forward_schedule(phase=1, rank=rank, microbatch_id=None,)
+                self.weight_compute_schedule(phase=0, rank=rank, microbatch_id=None,)
+                self.forward_schedule(phase=1, rank=rank, microbatch_id=None,recv=False)
+
+            # # Step 4 (Main step): nF0B1F1B0
+            step_4 = half_num_chunks - num_ranks + half_rank + 1
+            ############## we reduce one warmup step for F0 and F1 ##############
+            for i in range(step_4):
+                # F0B1
+                if i == 0:
+                    if self.is_middle_rank(curr_rank=rank):
+                        # NOTE: We don't overlap these two chunks to further reduce bubble size.
+                        self.forward_schedule(phase=0, rank=rank, microbatch_id=None, recv=False, send=False)
+                        self.send_forward_schedule(phase=1, rank=rank, microbatch_id=None,)
+                        self.backward_schedule(phase=1, rank=rank, microbatch_id=None, send=False)
+                        self.send_forward_schedule(phase=0, rank=rank, microbatch_id=None,)
+                        self.send_backward_schedule(phase=1, rank=rank, microbatch_id=None,)
+                    else:
+                        self.forward_backward_schedule(phase0=0, phase1=1, rank=rank, recv0=False)
+                else:
+                    if i < step_4 - additional_warmup:
+                        # Do F0B1
+                        self.forward_backward_schedule(phase0=0, phase1=1, rank=rank, )
+                    else:
+                        # Do B1 only
+                        self.backward_schedule(phase=1, rank=rank, microbatch_id=None)
+                    
+                    # self.forward_backward_schedule(phase0=0, phase1=1, rank=rank, )
+                    
+
+                if i < step_4 - additional_warmup:
+                    # Do F1B0
+                    self.forward_backward_schedule(phase0=1, phase1=0, rank=rank,)
+                else:
+                    # Do B0 only
+                    self.backward_schedule(phase=0, rank=rank, microbatch_id=None)
+                
+                # self.forward_backward_schedule(phase0=1, phase1=0, rank=rank, )
+
+            # # Step 5: nB1F1B0
+            step_5 = num_half_ranks - half_rank - 1
+            ############## we reduce one warmup step for F1 ##############
+            for i in range(step_5):
+                self.backward_schedule(phase=1, rank=rank)
+                self.forward_backward_schedule(phase0=1, phase1=0, rank=rank)
+
+            # Step 6: nB1B0 (The second half of the chunks use zero bubble)
+            step_6 = half_rank + 1
+            enable_zb = False
+            for i in range(step_6):
+                if i == step_6 // 2 and half_rank % 2 == 1:
+                    enable_zb = True
+                self.backward_schedule(phase=1, rank=rank, enable_zb=enable_zb)
+                if i == step_6 // 2 and half_rank % 2 == 0:
+                    enable_zb = True
+                self.backward_schedule(phase=0, rank=rank, enable_zb=enable_zb)
+
+            # Step 7: nWB0 (Use zero bubble)
+            step_7 = num_half_ranks - half_rank - 1
+            
+            phase0_last_BW_microbatch_id = 0
+            phase1_last_BW_microbatch_id = 0
+            for node in self.dualpipe_schedules[rank]:
+                if node.type == FuncType.BW:
+                    if node.chunk == 0:
+                        phase0_last_BW_microbatch_id = node.minibatch
+                    elif node.chunk == 1:
+                        phase1_last_BW_microbatch_id = node.minibatch
+            phase0_rest_W = [i for i in range(phase0_last_BW_microbatch_id + 1, (self.num_microbatch) // 2)]
+            phase1_rest_W = [i for i in range(phase1_last_BW_microbatch_id + 1, (self.num_microbatch) // 2)]
+            
+            # # print(f"rank {rank} phase0_rest_W {phase0_rest_W} phase1_rest_W {phase1_rest_W} self.current_w_chunk_id {self.current_w_chunk_id[rank]}")
+            
+            for i in range(step_7):
+                phase = 0
+                if phase1_rest_W:
+                    phase = 1
+                    microbatch_id = phase1_rest_W.pop(0)
+                else:
+                    if phase0_rest_W:
+                        phase = 0
+                        microbatch_id = phase0_rest_W.pop(0)
+                self.weight_compute_schedule(phase=phase, rank=rank, microbatch_id=microbatch_id)
+                self.backward_schedule(phase=0, rank=rank, microbatch_id=microbatch_id, enable_zb=True)
+
+            # Step 8: nW
+            step_8 = half_rank + 1
+            for i in range(step_8):
+                phase = 0
+                if phase1_rest_W:
+                    # phase = 1
+                    microbatch_id = phase1_rest_W.pop(0)
+                else:
+                    if phase0_rest_W:
+                        # phase = 0
+                        microbatch_id = phase0_rest_W.pop(0)
+                self.weight_compute_schedule(phase=0, rank=rank, microbatch_id=microbatch_id)
+            # print(f"rank {rank} phase0_rest_W {phase0_rest_W} phase1_rest_W {phase1_rest_W} self.current_w_chunk_id {self.current_w_chunk_id[rank]}")
+
+    def print_pipeline_details(
+        self,
+        pipeline_schedule: List[List[ScheduledNode]],
+        chunk_mode: bool = False,  # print model chunk
+        mbs_mode: bool = False, # print mbs id
+        show_comm: bool = False, # print communication ops
+    ):
+        assert not (
+            chunk_mode and mbs_mode
+        ), f"Only one mode is supported at the same time, please choose from chunk_mode {chunk_mode} and mbs_mode {mbs_mode}"
+        schedule_str = ""
+        
+        node_type_list = [FuncType.F, FuncType.B, FuncType.W, FuncType.BW]
+        if show_comm:
+            node_type_list += [FuncType.SEND_FORWARD, FuncType.RECV_FORWARD, FuncType.SEND_BACKWARD, FuncType.RECV_BACKWARD]
+        for stage in range(len(pipeline_schedule)):
+            stage_nodes = []
+            for node in pipeline_schedule[stage]:
+                if node.type in node_type_list:
+                    if chunk_mode:
+                        stage_nodes.append(str(node.type) + str(node.chunk))
+                    elif mbs_mode:
+                        stage_nodes.append(str(node.type) + str(node.minibatch))
+                    else:
+                        stage_nodes.append(str(node.type))
+            stage_str = "".join([_ for _ in stage_nodes])
+            schedule_str += "\n" + stage_str
+        print(schedule_str)
+
